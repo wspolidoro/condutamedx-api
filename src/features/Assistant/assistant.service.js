@@ -141,11 +141,21 @@
       }
     },
     
-    async listAvailableAssistants(userId) {
+     async listAvailableAssistants(userId) {
       const user = await User.findByPk(userId, { 
         include: [{ model: Plan, as: 'currentPlan' }] 
       });
       if (!user) throw new Error('Usuário não encontrado.');
+
+      if (user.role === 'admin') {
+        return Assistant.findAll({
+          include: [
+            { model: Plan, as: 'allowedPlans', attributes: ['id', 'name'], through: { attributes: [] } },
+            { model: User, as: 'creator', attributes: ['id', 'name', 'email'] }
+          ],
+          order: [['isSystemAssistant', 'DESC'], ['name', 'ASC']]
+        });
+      }
 
       if (!user.currentPlan || !user.planExpiresAt || user.planExpiresAt < new Date()) {
         return [];
@@ -190,7 +200,24 @@
           throw new Error("Assistente não sincronizado. Edite e salve o assistente para sincronizar com a OpenAI.");
         }
         
-        const openaiClient = this._getOpenAIClientForExecution(user, assistant);
+        // ================== INÍCIO DA CORREÇÃO DE PERMISSÃO (Passo 1) ==================
+        let openaiClient;
+
+        if (assistant.isSystemAssistant) {
+            // Assistentes do sistema SEMPRE devem ser executados com a chave de API do sistema.
+            if (!systemOpenai) {
+                throw new Error("Chave de API do sistema indisponível para execução.");
+            }
+            openaiClient = systemOpenai;
+        } else {
+            // Assistentes de usuário SEMPRE devem ser executados com a chave de API do seu CRIADOR.
+            const creator = await User.findByPk(assistant.createdByUserId);
+            if (!creator || !creator.openAiApiKey) {
+                throw new Error(`O criador do assistente "${assistant.name}" não foi encontrado ou não possui uma chave de API configurada.`);
+            }
+            openaiClient = new OpenAI({ apiKey: creator.openAiApiKey });
+        }
+        // ================== FIM DA CORREÇÃO DE PERMISSÃO ==================
         
         const finalOutputFormat = options.outputFormat || assistant.outputFormat;
         
@@ -201,7 +228,8 @@
           inputText: transcription.transcriptionText,
           outputFormat: finalOutputFormat,
           status: 'pending',
-          usedSystemToken: !assistant.requiresUserOpenAiToken,
+          // ================== CORREÇÃO DO REGISTRO DE USO (Passo 3) ==================
+          usedSystemToken: assistant.isSystemAssistant,
         });
 
         (async () => {
@@ -265,120 +293,109 @@
       }
     },
 
-   // DEBUGGING COMPLETO - Adicione este código na função _pollRunStatus
-
-async _pollRunStatus(historyId, threadId, runId, openaiClient, user) {
-  // LOGS DE DEBUG COMPLETOS
-  console.log(`[DEBUG POLL START] historyId: ${historyId}`);
-  console.log(`[DEBUG POLL START] threadId: "${threadId}" (tipo: ${typeof threadId})`);
-  console.log(`[DEBUG POLL START] runId: "${runId}" (tipo: ${typeof runId})`);
-  console.log(`[DEBUG POLL START] openaiClient:`, !!openaiClient);
-  console.log(`[DEBUG POLL START] openaiClient.beta:`, !!openaiClient?.beta);
-  console.log(`[DEBUG POLL START] openaiClient.beta.threads:`, !!openaiClient?.beta?.threads);
-  console.log(`[DEBUG POLL START] openaiClient.beta.threads.runs:`, !!openaiClient?.beta?.threads?.runs);
-  
-  const startTime = Date.now();
-  const timeout = 5 * 60 * 1000;
-
-  while (Date.now() - startTime < timeout) {
-    try {
-      if (typeof threadId !== 'string' || !threadId.startsWith('thread_')) {
-        throw new Error(`[Validação] ID da Thread inválido no polling: ${threadId}`);
-      }
-      if (typeof runId !== 'string' || !runId.startsWith('run_')) {
-          throw new Error(`[Validação] ID da Run inválido no polling: ${runId}`);
-      }
+    async _pollRunStatus(historyId, threadId, runId, openaiClient, user) {
+      console.log(`[DEBUG POLL START] historyId: ${historyId}`);
+      console.log(`[DEBUG POLL START] threadId: "${threadId}" (tipo: ${typeof threadId})`);
+      console.log(`[DEBUG POLL START] runId: "${runId}" (tipo: ${typeof runId})`);
+      console.log(`[DEBUG POLL START] openaiClient:`, !!openaiClient);
+      console.log(`[DEBUG POLL START] openaiClient.beta:`, !!openaiClient?.beta);
+      console.log(`[DEBUG POLL START] openaiClient.beta.threads:`, !!openaiClient?.beta?.threads);
+      console.log(`[DEBUG POLL START] openaiClient.beta.threads.runs:`, !!openaiClient?.beta?.threads?.runs);
       
-      console.log(`[Polling] HistoryID: ${historyId} - Verificando status da Run: ${runId} na Thread: ${threadId}`);
+      const startTime = Date.now();
+      const timeout = 5 * 60 * 1000;
 
-      // TENTATIVA 1: Método direto com debugging
-      console.log(`[DEBUG RETRIEVE] Tentativa 1 - Método direto`);
-      console.log(`[DEBUG RETRIEVE] threadId: "${threadId}", runId: "${runId}"`);
-      
-      try {
-        const runStatus = await openaiClient.beta.threads.runs.retrieve(threadId, runId);
-        console.log(`[SUCCESS] Retrieve funcionou! Status: ${runStatus.status}`);
-        
-        await AssistantHistory.update({ status: runStatus.status }, { where: { id: historyId } });
-
-        if (runStatus.status === 'completed') {
-            await this._processCompletedRun(historyId, threadId, openaiClient, user);
-            return;
-        }
-        
-        if (['failed', 'cancelled', 'expired'].includes(runStatus.status)) {
-            const lastError = runStatus.last_error;
-            const errorMessage = `A execução falhou com status: ${runStatus.status}. Causa: ${lastError ? lastError.message : 'Nenhuma informação adicional.'}`;
-            console.error(`[ERRO] HistoryID: ${historyId} - ${errorMessage}`);
-            await AssistantHistory.update({ status: 'failed', errorMessage }, { where: { id: historyId } });
-            return;
-        }
-
-        if (runStatus.status === 'requires_action') {
-            const errorMessage = 'A execução parou pois requer uma ação manual (ex: function calling) que não está implementada.';
-            console.warn(`[AVISO] Run ${runId} requer ação.`, runStatus.required_action);
-            await AssistantHistory.update({ status: 'failed', errorMessage }, { where: { id: historyId } });
-            return;
-        }
-
-        await sleep(3000);
-        
-      } catch (retrieveError) {
-        console.error(`[ERRO RETRIEVE] Falha na chamada retrieve:`, retrieveError.message);
-        
-        // TENTATIVA 2: Método alternativo usando fetch direto
-        console.log(`[DEBUG] Tentativa 2 - Usando abordagem alternativa`);
-        
+      while (Date.now() - startTime < timeout) {
         try {
-          // Construir a URL manualmente para ver se o problema está na construção do path
-          const url = `https://api.openai.com/v1/threads/${threadId}/runs/${runId}`;
-          console.log(`[DEBUG] URL construída: ${url}`);
-          
-          // Fazer a requisição HTTP direta
-          const response = await fetch(url, {
-            method: 'GET',
-            headers: {
-              'Authorization': `Bearer ${openaiClient.apiKey}`,
-              'Content-Type': 'application/json',
-              'OpenAI-Beta': 'assistants=v2'
-            }
-          });
-          
-          if (!response.ok) {
-            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+          if (typeof threadId !== 'string' || !threadId.startsWith('thread_')) {
+            throw new Error(`[Validação] ID da Thread inválido no polling: ${threadId}`);
+          }
+          if (typeof runId !== 'string' || !runId.startsWith('run_')) {
+              throw new Error(`[Validação] ID da Run inválido no polling: ${runId}`);
           }
           
-          const runStatus = await response.json();
-          console.log(`[SUCCESS] Fetch direto funcionou! Status: ${runStatus.status}`);
+          console.log(`[Polling] HistoryID: ${historyId} - Verificando status da Run: ${runId} na Thread: ${threadId}`);
+          console.log(`[DEBUG RETRIEVE] Tentativa 1 - Método direto`);
+          console.log(`[DEBUG RETRIEVE] threadId: "${threadId}", runId: "${runId}"`);
           
-          // Continuar com o processamento normal
-          await AssistantHistory.update({ status: runStatus.status }, { where: { id: historyId } });
+          try {
+            const runStatus = await openaiClient.beta.threads.runs.retrieve(threadId, runId);
+            console.log(`[SUCCESS] Retrieve funcionou! Status: ${runStatus.status}`);
+            
+            await AssistantHistory.update({ status: runStatus.status }, { where: { id: historyId } });
 
-          if (runStatus.status === 'completed') {
-              await this._processCompletedRun(historyId, threadId, openaiClient, user);
-              return;
+            if (runStatus.status === 'completed') {
+                await this._processCompletedRun(historyId, threadId, openaiClient, user);
+                return;
+            }
+            
+            if (['failed', 'cancelled', 'expired'].includes(runStatus.status)) {
+                const lastError = runStatus.last_error;
+                const errorMessage = `A execução falhou com status: ${runStatus.status}. Causa: ${lastError ? lastError.message : 'Nenhuma informação adicional.'}`;
+                console.error(`[ERRO] HistoryID: ${historyId} - ${errorMessage}`);
+                await AssistantHistory.update({ status: 'failed', errorMessage }, { where: { id: historyId } });
+                return;
+            }
+
+            if (runStatus.status === 'requires_action') {
+                const errorMessage = 'A execução parou pois requer uma ação manual (ex: function calling) que não está implementada.';
+                console.warn(`[AVISO] Run ${runId} requer ação.`, runStatus.required_action);
+                await AssistantHistory.update({ status: 'failed', errorMessage }, { where: { id: historyId } });
+                return;
+            }
+
+            await sleep(3000);
+            
+          } catch (retrieveError) {
+            console.error(`[ERRO RETRIEVE] Falha na chamada retrieve:`, retrieveError.message);
+            
+            console.log(`[DEBUG] Tentativa 2 - Usando abordagem alternativa`);
+            
+            try {
+              const url = `https://api.openai.com/v1/threads/${threadId}/runs/${runId}`;
+              console.log(`[DEBUG] URL construída: ${url}`);
+              
+              const response = await fetch(url, {
+                method: 'GET',
+                headers: {
+                  'Authorization': `Bearer ${openaiClient.apiKey}`,
+                  'Content-Type': 'application/json',
+                  'OpenAI-Beta': 'assistants=v2'
+                }
+              });
+              
+              if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+              }
+              
+              const runStatus = await response.json();
+              console.log(`[SUCCESS] Fetch direto funcionou! Status: ${runStatus.status}`);
+              
+              await AssistantHistory.update({ status: runStatus.status }, { where: { id: historyId } });
+
+              if (runStatus.status === 'completed') {
+                  await this._processCompletedRun(historyId, threadId, openaiClient, user);
+                  return;
+              }
+              
+            } catch (fetchError) {
+              console.error(`[ERRO FETCH] Falha no fetch direto:`, fetchError.message);
+              throw retrieveError;
+            }
           }
-          
-          // ... resto da lógica igual
-          
-        } catch (fetchError) {
-          console.error(`[ERRO FETCH] Falha no fetch direto:`, fetchError.message);
-          throw retrieveError; // Re-lançar o erro original
+
+        } catch (error) {
+          const errorMessage = error.response?.data?.error?.message || error.message;
+          console.error(`[ERRO] Exceção durante o polling [RunID: ${runId}]: ${errorMessage}`, { stack: error.stack });
+          await AssistantHistory.update({ status: 'failed', errorMessage: `Erro de comunicação com a OpenAI: ${errorMessage}` }, { where: { id: historyId } });
+          return;
         }
       }
 
-    } catch (error) {
-      const errorMessage = error.response?.data?.error?.message || error.message;
-      console.error(`[ERRO] Exceção durante o polling [RunID: ${runId}]: ${errorMessage}`, { stack: error.stack });
-      await AssistantHistory.update({ status: 'failed', errorMessage: `Erro de comunicação com a OpenAI: ${errorMessage}` }, { where: { id: historyId } });
-      return;
-    }
-  }
-
-  const timeoutMessage = 'A execução excedeu o tempo limite de 5 minutos.';
-  console.error(`[ERRO] HistoryID: ${historyId} - ${timeoutMessage}`);
-  await AssistantHistory.update({ status: 'failed', errorMessage: timeoutMessage }, { where: { id: historyId } });
-},
+      const timeoutMessage = 'A execução excedeu o tempo limite de 5 minutos.';
+      console.error(`[ERRO] HistoryID: ${historyId} - ${timeoutMessage}`);
+      await AssistantHistory.update({ status: 'failed', errorMessage: timeoutMessage }, { where: { id: historyId } });
+    },
 
     async _processCompletedRun(historyId, threadId, openaiClient, user) {
       const messages = await openaiClient.beta.threads.messages.list(threadId, { order: 'desc', limit: 1 });
@@ -429,6 +446,8 @@ async _pollRunStatus(historyId, threadId, runId, openaiClient, user) {
         return new OpenAI({ apiKey: user.openAiApiKey });
     },
     
+    // ================== FUNÇÃO REMOVIDA (Passo 2) ==================
+    /*
     _getOpenAIClientForExecution(user, assistant) {
       if (user.role === 'admin' || !assistant.requiresUserOpenAiToken) {
         if (!systemOpenai) throw new Error("Chave de API do sistema indisponível para execução.");
@@ -437,21 +456,16 @@ async _pollRunStatus(historyId, threadId, runId, openaiClient, user) {
       if (!user.openAiApiKey) throw new Error('Este assistente requer sua chave de API OpenAI para ser executado.');
       return new OpenAI({ apiKey: user.openAiApiKey });
     },
+    */
 
    async _validateUserPlanForCreation(userId) {
-    // --- CORREÇÃO APLICADA AQUI ---
-    // Se o userId for nulo, significa que é uma ação de sistema (admin).
-    // Neste caso, não há plano para validar. Retornamos um objeto de usuário simulado
-    // que passará nas verificações de `role` subsequentes.
     if (!userId) {
       return { user: { role: 'admin' } };
     }
 
-    // Se houver um userId, a lógica original para usuários normais continua.
     const user = await User.findByPk(userId, { include: [{ model: Plan, as: 'currentPlan' }] });
     if (!user) throw new Error('Usuário não encontrado.');
 
-    // A validação de plano só se aplica a usuários que não são administradores.
     if (user.role !== 'admin') {
         const plan = user.currentPlan;
         if (!plan || user.planExpiresAt < new Date()) throw new Error('Você precisa de um plano ativo para criar assistentes.');
@@ -475,25 +489,38 @@ async _pollRunStatus(historyId, threadId, runId, openaiClient, user) {
         return { user, assistant };
     },
 
-    async _validateRunInputs(userId, assistantId, transcriptionId) {
-      const user = await User.findByPk(userId, { include: { model: Plan, as: 'currentPlan' } });
-      if (!user) throw new Error('Usuário não encontrado.');
+  async _validateRunInputs(userId, assistantId, transcriptionId) {
+        const user = await User.findByPk(userId, { include: { model: Plan, as: 'currentPlan' } });
+        if (!user) throw new Error('Usuário não encontrado.');
+  
+        const assistant = await Assistant.findByPk(assistantId);
+        if (!assistant) throw new Error('Assistente não encontrado.');
+  
+        const transcriptionWhereClause = { id: transcriptionId };
+        if (user.role !== 'admin') {
+            transcriptionWhereClause.userId = user.id;
+        }
+        const transcription = await Transcription.findOne({ where: transcriptionWhereClause });
 
-      const assistant = await Assistant.findByPk(assistantId);
-      if (!assistant) throw new Error('Assistente não encontrado.');
+        if (!transcription) throw new Error('Transcrição não encontrada ou sem permissão de acesso.');
+        if (transcription.status !== 'completed') throw new Error('A transcrição ainda não foi concluída e não pode ser usada.');
+  
+        if (user.role !== 'admin') {
+            if (!assistant.requiresUserOpenAiToken) {
+                const plan = user.currentPlan;
+                if (!plan || user.planExpiresAt < new Date()) {
+                    throw new Error('Você precisa de um plano ativo para executar assistentes.');
+                }
+                const limit = plan.features.maxAssistantUses ?? 0;
+                if (limit !== -1 && user.assistantUsesUsed >= limit) {
+                    throw new Error('Você atingiu o limite de uso de assistentes do seu plano.');
+                }
+            }
+        }
 
-      const transcription = await Transcription.findOne({ where: { id: transcriptionId, userId: user.id } });
-      if (!transcription) throw new Error('Transcrição não encontrada ou sem permissão de acesso.');
-      if (transcription.status !== 'completed') throw new Error('A transcrição ainda não foi concluída e não pode ser usada.');
-
-      if (user.role !== 'admin' && !assistant.requiresUserOpenAiToken) {
-          const plan = user.currentPlan;
-          if (!plan || user.planExpiresAt < new Date()) throw new Error('Você precisa de um plano ativo para executar assistentes.');
-          const limit = plan.features.maxAssistantUses ?? 0;
-          if (limit !== -1 && user.assistantUsesUsed >= limit) throw new Error('Você atingiu o limite de uso de assistentes do seu plano.');
-      }
-      return { user, assistant, transcription };
+        return { user, assistant, transcription };
     },
+      
     
     async listUserHistory(userId, filters = {}) {
       const { status, page = 1, limit = 10, transcriptionId } = filters;

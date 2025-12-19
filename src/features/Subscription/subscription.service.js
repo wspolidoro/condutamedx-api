@@ -3,9 +3,35 @@ const db = require('../../config/database');
 const mercadopago = require('../../config/mercadoPago'); // Importa a configuração do MP
 const { User, Plan, SubscriptionOrder } = db; // Importa os modelos necessários
 
-
+// Função auxiliar para formatar a data para o padrão exigido pelo Mercado Pago
+function formatMercadoPagoDate(date) {
+    const pad = (n) => String(n).padStart(2, '0');
+    const padMs = (n) => String(n).padStart(3, '0');
+    
+    const year = date.getFullYear();
+    const month = pad(date.getMonth() + 1);
+    const day = pad(date.getDate());
+    const hours = pad(date.getHours());
+    const minutes = pad(date.getMinutes());
+    const seconds = pad(date.getSeconds());
+    const ms = padMs(date.getMilliseconds());
+    
+    const offset = -date.getTimezoneOffset();
+    const offsetHours = Math.floor(Math.abs(offset) / 60);
+    const offsetMinutes = Math.abs(offset) % 60;
+    const sign = offset >= 0 ? '+' : '-';
+    const offsetFormatted = `${sign}${pad(offsetHours)}:${pad(offsetMinutes)}`;
+    
+    return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}.${ms}${offsetFormatted}`;
+}
 
 const subscriptionService = {
+  /**
+   * Cria um checkout de assinatura recorrente no Mercado Pago.
+   * @param {string} userId - ID do usuário.
+   * @param {string} planId - ID do plano.
+   * @returns {object} Detalhes do checkout.
+   */
   async createCheckoutForPlan(userId, planId) {
     if (!mercadopago.isConfigured) {
       console.error('[Checkout] Tentativa de criar checkout, mas o SDK do Mercado Pago não está configurado.');
@@ -27,132 +53,126 @@ const subscriptionService = {
       });
       
       const priceAsFloat = parseFloat(plan.price);
+      const endDate = new Date();
+      endDate.setFullYear(endDate.getFullYear() + 1);
 
-      const preferencePayload = {
-        items: [{
-          title: `Assinatura Plano: ${plan.name}`,
-          quantity: 1,
-          currency_id: 'BRL',
-          unit_price: priceAsFloat,
-        }],
-        payer: {
-          email: user.email,
-        },
-        back_urls: {
-          success: `${process.env.FRONTEND_URL}/dashboard?payment_status=success`,
-          failure: `${process.env.FRONTEND_URL}/dashboard?payment_status=failure`,
-          pending: `${process.env.FRONTEND_URL}/dashboard?payment_status=pending`,
-        },
-        auto_return: 'approved',
+      const subscriptionPayload = {
+        reason: `Assinatura Mensal - Plano ${plan.name}`,
         external_reference: subscriptionOrder.id,
+        payer_email: user.email,
+        auto_recurring: {
+          frequency: 1,
+          frequency_type: "months",
+          transaction_amount: priceAsFloat,
+          currency_id: "BRL",
+          start_date: formatMercadoPagoDate(new Date()),
+          end_date: formatMercadoPagoDate(endDate),
+        },
+        back_url: `${process.env.FRONTEND_URL}/dashboard?subscription_status=success`,
         notification_url: `${process.env.BACKEND_URL}/api/subscriptions/webhook`,
+        status: 'pending',
       };
 
-      console.log("[MercadoPago] Enviando objeto de preferência:", JSON.stringify(preferencePayload, null, 2));
+      console.log("[MercadoPago] Enviando objeto de assinatura (preapproval):", JSON.stringify(subscriptionPayload, null, 2));
 
-      // =========================================================================
-      // >>>>>>>>> A CORREÇÃO ESTÁ AQUI <<<<<<<<<<<<<<<
-      // O payload completo deve ser passado dentro da propriedade "body".
-      // =========================================================================
-      const response = await mercadopago.preferences.create({ body: preferencePayload });
+      // A CORREÇÃO ESTÁ AQUI: O payload completo deve ser passado dentro da propriedade "body".
+      const response = await mercadopago.preapproval.create({ body: subscriptionPayload });
+      const responseBody = response;
 
       await subscriptionOrder.update({
-        mercadopagoPreferenceId: response.id,
+        mercadopagoPreferenceId: responseBody.id,
       });
 
       return {
-        checkoutUrl: response.init_point,
-        preferenceId: response.id,
-        sandboxUrl: response.sandbox_init_point,
+        checkoutUrl: responseBody.init_point,
+        preapprovalId: responseBody.id,
       };
 
     } catch (error) {
-      // O erro 'error.response?.data' geralmente contém a resposta da API do Mercado Pago
-      console.error('Erro ao criar checkout para plano:', error.response?.data || error.message || error);
+      console.error('Erro ao criar checkout de assinatura:', error.response?.data || error.message || error);
       throw new Error(error.response?.data?.message || 'Erro ao comunicar com o serviço de pagamento.');
     }
   },
+
   /**
-   * Processa notificações de webhook do Mercado Pago.
+   * Processa notificações de webhook do Mercado Pago para assinaturas.
    * @param {object} data - Dados recebidos do webhook.
    */
- async processWebhook(data) {
-  try {
-    const { type, data: webhookData } = data;
+  async processWebhook(data) {
+    try {
+      const { type, data: webhookData } = data;
 
-    if (type === 'payment') {
-      const paymentId = webhookData.id;
-      const paymentDetails = await mercadopago.payment.get({ id: paymentId });
-      const paymentBody = paymentDetails;
-      const subscriptionOrderId = paymentBody.external_reference;
+      if (type === 'preapproval') {
+        const preapprovalId = webhookData.id;
+        const preapprovalDetails = await mercadopago.preapproval.get(preapprovalId);
+        const preapprovalBody = preapprovalDetails;
+        
+        const subscriptionOrderId = preapprovalBody.external_reference;
 
-      if (!subscriptionOrderId) {
-        console.log('Webhook de pagamento sem external_reference. Ignorando.');
-        return;
-      }
+        if (!subscriptionOrderId) {
+          console.log(`Webhook de assinatura ${preapprovalId} sem external_reference. Ignorando.`);
+          return;
+        }
 
-      const subscriptionOrder = await SubscriptionOrder.findByPk(subscriptionOrderId, {
-        include: [{ model: User, as: 'user' }, { model: Plan, as: 'plan' }],
-      });
+        const subscriptionOrder = await SubscriptionOrder.findByPk(subscriptionOrderId, {
+          include: [{ model: User, as: 'user' }, { model: Plan, as: 'plan' }],
+        });
 
-      if (!subscriptionOrder) {
-        console.log(`Pedido de assinatura ${subscriptionOrderId} não encontrado. Ignorando webhook.`);
-        return;
-      }
+        if (!subscriptionOrder) {
+          console.log(`Pedido de assinatura ${subscriptionOrderId} não encontrado. Ignorando webhook.`);
+          return;
+        }
 
-      let newStatus = 'pending';
-      switch (paymentBody.status) {
-        case 'approved': newStatus = 'approved'; break;
-        case 'rejected': newStatus = 'rejected'; break;
-        case 'cancelled': newStatus = 'cancelled'; break;
-        case 'in_process': newStatus = 'in_process'; break;
-      }
+        let newStatus = 'pending';
+        if (preapprovalBody.status === 'authorized') {
+            newStatus = 'approved';
+        } else if (preapprovalBody.status === 'cancelled' || preapprovalBody.status === 'paused') {
+            newStatus = 'cancelled';
+        }
 
-      await subscriptionOrder.update({
-        status: newStatus,
-        mercadopagoPaymentId: paymentId,
-        mercadopagoPaymentDetails: paymentBody,
-      });
+        await subscriptionOrder.update({
+          status: newStatus,
+          mercadopagoPaymentId: preapprovalId,
+          mercadopagoPaymentDetails: preapprovalBody,
+        });
 
-      if (newStatus === 'approved') {
         const user = subscriptionOrder.user;
         const plan = subscriptionOrder.plan;
 
-        if (user && plan) {
-          // --- LÓGICA DE ATIVAÇÃO CORRIGIDA ---
+        if (newStatus === 'approved' && user && plan) {
           let newExpirationDate = new Date();
-          // Se o usuário já tem um plano ativo, estende a partir da data de expiração atual
           if (user.planExpiresAt && user.planExpiresAt > newExpirationDate) {
             newExpirationDate = new Date(user.planExpiresAt);
           }
           newExpirationDate.setDate(newExpirationDate.getDate() + plan.durationInDays);
 
-          // Atualiza o usuário com o plano, a data de expiração e reseta os contadores
           await user.update({
             planId: plan.id,
             planExpiresAt: newExpirationDate,
             transcriptionsUsedCount: 0,
             transcriptionMinutesUsed: 0,
             agentUsesUsed: 0,
+            assistantUsesUsed: 0,
           });
-          console.log(`Plano "${plan.name}" ativado para o usuário ${user.email} até ${newExpirationDate.toISOString()}`);
-          // TODO: Enviar email de confirmação
+          console.log(`Plano "${plan.name}" ativado/renovado para o usuário ${user.email} até ${newExpirationDate.toISOString()}`);
+        
+        } else if (newStatus === 'cancelled' && user) {
+            await user.update({
+                planId: null,
+                planExpiresAt: new Date()
+            });
+            console.log(`Assinatura do usuário ${user.email} foi cancelada. Plano removido.`);
         } else {
-          console.error(`Erro: Usuário ou Plano não encontrados para ativar a assinatura do pedido ${subscriptionOrderId}.`);
+          console.log(`Status da assinatura ${subscriptionOrderId} atualizado para ${preapprovalBody.status}.`);
         }
-      } else {
-        console.log(`Pagamento do pedido de assinatura ${subscriptionOrderId} foi ${newStatus}.`);
       }
+    } catch (error) {
+      console.error('Erro ao processar webhook de assinatura:', error);
     }
-  } catch (error) {
-    console.error('Erro ao processar webhook de assinatura:', error);
-  }
-},
-
+  },
 
   /**
    * Verifica o status de um pedido de assinatura.
-   * Pode ser usado pelo frontend para polling.
    * @param {string} subscriptionOrderId - ID do pedido de assinatura.
    * @returns {object} O pedido de assinatura com status atualizado.
    */
@@ -166,41 +186,25 @@ const subscriptionService = {
         throw new Error('Pedido de assinatura não encontrado.');
       }
 
-      // Se já estiver aprovado, não precisa consultar o MP novamente
       if (subscriptionOrder.status === 'approved') {
         return subscriptionOrder;
       }
 
-      // Se houver um ID de pagamento do MP, consulte o status mais recente
-      if (subscriptionOrder.mercadopagoPaymentId) {
+      if (subscriptionOrder.mercadopagoPreferenceId) {
         try {
-          const payment = await mercadopago.payment.findById(subscriptionOrder.mercadopagoPaymentId);
-          const paymentData = payment.body;
+          const preapproval = await mercadopago.preapproval.get(subscriptionOrder.mercadopagoPreferenceId);
+          const preapprovalData = preapproval;
 
           let statusAtualizado = subscriptionOrder.status;
-          switch (paymentData.status) {
-            case 'approved':
-              statusAtualizado = 'approved';
-              break;
-            case 'rejected':
-              statusAtualizado = 'rejected';
-              break;
-            case 'cancelled':
-              statusAtualizado = 'cancelled';
-              break;
-            case 'pending':
-            case 'in_process':
-              statusAtualizado = 'in_process';
-              break;
-          }
+          if (preapprovalData.status === 'authorized') statusAtualizado = 'approved';
+          if (preapprovalData.status === 'cancelled' || preapprovalData.status === 'paused') statusAtualizado = 'cancelled';
 
           if (statusAtualizado !== subscriptionOrder.status) {
             await subscriptionOrder.update({
               status: statusAtualizado,
-              mercadopagoPaymentDetails: paymentData,
+              mercadopagoPaymentDetails: preapprovalData,
             });
 
-            // Se o status mudou para aprovado aqui (via polling), ativa o plano
             if (statusAtualizado === 'approved') {
               const user = subscriptionOrder.user;
               const plan = subscriptionOrder.plan;
@@ -217,12 +221,10 @@ const subscriptionService = {
                 console.log(`Plano "${plan.name}" ativado/estendido para o usuário ${user.email} via verificação de status.`);
               }
             }
-            // Recarrega o pedido para retornar o status mais recente
             return await SubscriptionOrder.findByPk(subscriptionOrderId);
           }
         } catch (mpError) {
           console.error('Erro ao verificar status no Mercado Pago:', mpError);
-          // Não lançar erro, apenas logar e retornar o status atual do DB
         }
       }
       return subscriptionOrder;
@@ -242,12 +244,9 @@ const subscriptionService = {
     try {
       const { status, page = 1, limit = 10 } = filters;
       const where = {};
-
       if (userId) where.userId = userId;
       if (status) where.status = status;
-
       const offset = (page - 1) * limit;
-
       const { count, rows } = await SubscriptionOrder.findAndCountAll({
         where,
         include: [
@@ -258,7 +257,6 @@ const subscriptionService = {
         offset,
         order: [['createdAt', 'DESC']],
       });
-
       return {
         orders: rows,
         total: count,
@@ -281,12 +279,9 @@ const subscriptionService = {
       const user = await User.findByPk(userId, {
         include: [{ model: Plan, as: 'currentPlan' }],
       });
-
       if (!user) {
         throw new Error('Usuário não encontrado.');
       }
-
-      // Verifica se o plano ainda está ativo com base na data de expiração
       if (user.currentPlan && user.planExpiresAt && user.planExpiresAt > new Date()) {
         return {
           plan: user.currentPlan,
@@ -294,14 +289,10 @@ const subscriptionService = {
           remainingDays: Math.ceil((user.planExpiresAt.getTime() - new Date().getTime()) / (1000 * 60 * 60 * 24))
         };
       }
-
-      // Se o plano expirou ou não há plano, limpa o planId e planExpiresAt do usuário
       if (user.planId) {
           await user.update({ planId: null, planExpiresAt: null });
       }
-
       return null;
-
     } catch (error) {
       console.error('Erro ao obter plano ativo do usuário:', error);
       throw error;
